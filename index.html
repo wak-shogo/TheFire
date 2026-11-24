@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="TheFire">
+  <meta name="description" content="リアルタイム物理流体シミュレーションで描く、ウルトラシンプルな焚き火。">
+  <title>TheFire</title>
+  <link rel="icon" type="image/svg+xml" href="icon.svg">
+  <link rel="manifest" href="manifest.json">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="fireCanvas" aria-label="焚き火シミュレーション"></canvas>
+
+  <button
+    id="menuBtn"
+    class="menu-btn"
+    type="button"
+    aria-label="設定メニューを開く"
+    aria-controls="menuDrawer"
+    aria-expanded="false"
+  >
+    <span class="menu-btn-line"></span>
+    <span class="menu-btn-line"></span>
+    <span class="menu-btn-line"></span>
+  </button>
+
+  <div id="drawerBackdrop" class="drawer-backdrop" aria-hidden="true"></div>
+
+  <aside id="menuDrawer" class="drawer" aria-label="炎の設定" aria-hidden="true">
+    <div class="drawer-header">
+      <span class="drawer-title">TheFire</span>
+      <button id="closeBtn" class="close-btn" type="button" aria-label="設定メニューを閉じる">
+        <span></span>
+        <span></span>
+      </button>
+    </div>
+
+    <div class="drawer-body">
+      <!-- 色 -->
+      <div class="control-group">
+        <div class="control-label">
+          <span>色</span>
+          <span id="colorName" class="control-value">焚き火</span>
+        </div>
+        <div class="color-swatches" role="radiogroup" aria-label="炎の色">
+          <button class="swatch active" type="button" data-color="#ff6a14" data-name="焚き火" style="--swatch:#ff6a14" aria-label="焚き火"></button>
+          <button class="swatch" type="button" data-color="#e53412" data-name="熾火" style="--swatch:#e53412" aria-label="熾火"></button>
+          <button class="swatch" type="button" data-color="#2b8aff" data-name="青炎" style="--swatch:#2b8aff" aria-label="青炎"></button>
+          <button class="swatch" type="button" data-color="#1ed475" data-name="翠炎" style="--swatch:#1ed475" aria-label="翠炎"></button>
+          <button class="swatch" type="button" data-color="#9e4dff" data-name="紫炎" style="--swatch:#9e4dff" aria-label="紫炎"></button>
+          <button class="swatch" type="button" data-color="#ff3d8b" data-name="桃炎" style="--swatch:#ff3d8b" aria-label="桃炎"></button>
+          <label class="swatch swatch-custom" aria-label="カスタムカラー">
+            <input id="customColor" type="color" value="#ff6a14">
+            <span class="swatch-custom-ring"></span>
+          </label>
+        </div>
+      </div>
+
+      <!-- 勢い -->
+      <div class="control-group">
+        <div class="control-label">
+          <label for="intensityRange">勢い</label>
+          <output id="intensityValue" class="control-value" for="intensityRange">68%</output>
+        </div>
+        <input id="intensityRange" class="slider" type="range" min="10" max="100" step="1" value="68">
+      </div>
+
+      <!-- 最大明るさ -->
+      <div class="control-group">
+        <div class="control-label">
+          <label for="maxBrightnessRange">最大の明るさ</label>
+          <output id="maxBrightnessValue" class="control-value" for="maxBrightnessRange">95%</output>
+        </div>
+        <input id="maxBrightnessRange" class="slider" type="range" min="5" max="100" step="1" value="95">
+      </div>
+
+      <!-- 最小明るさ -->
+      <div class="control-group">
+        <div class="control-label">
+          <label for="minBrightnessRange">最小の明るさ</label>
+          <output id="minBrightnessValue" class="control-value" for="minBrightnessRange">35%</output>
+        </div>
+        <input id="minBrightnessRange" class="slider" type="range" min="0" max="100" step="1" value="35">
+      </div>
+
+      <!-- フェードアウト時間 -->
+      <div class="control-group">
+        <div class="control-label">
+          <label for="fadeoutRange">フェードアウト時間</label>
+          <output id="fadeoutValue" class="control-value" for="fadeoutRange">なし</output>
+        </div>
+        <div class="preset-row" role="group" aria-label="フェードアウトプリセット">
+          <button class="preset-chip active" type="button" data-minutes="0">なし</button>
+          <button class="preset-chip" type="button" data-minutes="1">1分</button>
+          <button class="preset-chip" type="button" data-minutes="5">5分</button>
+          <button class="preset-chip" type="button" data-minutes="15">15分</button>
+          <button class="preset-chip" type="button" data-minutes="30">30分</button>
+          <button class="preset-chip" type="button" data-minutes="60">60分</button>
+        </div>
+        <input id="fadeoutRange" class="slider" type="range" min="0" max="60" step="1" value="0">
+
+        <div id="fadeStatus" class="fade-status" hidden>
+          <span id="fadeRemaining" class="fade-remaining">残り 00:00</span>
+          <button id="relightBtn" class="text-btn" type="button">再点火</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="drawer-footer">
+      <button id="resetBtn" class="reset-btn" type="button">初期設定に戻す</button>
+    </div>
+  </aside>
+
+  <script src="fire-sim.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
