@@ -7,7 +7,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="TheFire">
-  <meta name="description" content="リアルタイム物理流体シミュレーションで描く、ウルトラシンプルな焚き火。">
+  <meta name="description" content="リアルタイム物理流体シミュレーションと1/fゆらぎで描く、ウルトラシンプルな焚き火。">
   <title>TheFire</title>
   <link rel="icon" type="image/svg+xml" href="icon.svg">
   <link rel="manifest" href="manifest.json">
@@ -61,34 +61,52 @@
         </div>
       </div>
 
-      <!-- 勢い -->
+      <!-- 勢い (1% - 150%) -->
       <div class="control-group">
         <div class="control-label">
           <label for="intensityRange">勢い</label>
-          <output id="intensityValue" class="control-value" for="intensityRange">68%</output>
+          <output id="intensityValue" class="control-value" for="intensityRange">55%</output>
         </div>
-        <input id="intensityRange" class="slider" type="range" min="10" max="100" step="1" value="68">
+        <input id="intensityRange" class="slider" type="range" min="1" max="150" step="1" value="55">
       </div>
 
-      <!-- 最大明るさ -->
+      <!-- タイムスケール (対数スケール: 0.05x - 8.0x) -->
+      <div class="control-group">
+        <div class="control-label">
+          <label for="timeScaleRange">タイムスケール</label>
+          <output id="timeScaleValue" class="control-value" for="timeScaleRange">1.00×</output>
+        </div>
+        <input id="timeScaleRange" class="slider" type="range" min="0" max="1000" step="1" value="590">
+      </div>
+
+      <!-- カメラ距離 (対数スケール: 0.25m - 4.00m) -->
+      <div class="control-group">
+        <div class="control-label">
+          <label for="distanceRange">カメラ距離</label>
+          <output id="distanceValue" class="control-value" for="distanceRange">1.25m</output>
+        </div>
+        <input id="distanceRange" class="slider" type="range" min="0" max="1000" step="1" value="580">
+      </div>
+
+      <!-- 最大明るさ (1% - 150%) -->
       <div class="control-group">
         <div class="control-label">
           <label for="maxBrightnessRange">最大の明るさ</label>
           <output id="maxBrightnessValue" class="control-value" for="maxBrightnessRange">95%</output>
         </div>
-        <input id="maxBrightnessRange" class="slider" type="range" min="5" max="100" step="1" value="95">
+        <input id="maxBrightnessRange" class="slider" type="range" min="1" max="150" step="1" value="95">
       </div>
 
-      <!-- 最小明るさ -->
+      <!-- 最小明るさ (0% - 150%) -->
       <div class="control-group">
         <div class="control-label">
           <label for="minBrightnessRange">最小の明るさ</label>
           <output id="minBrightnessValue" class="control-value" for="minBrightnessRange">35%</output>
         </div>
-        <input id="minBrightnessRange" class="slider" type="range" min="0" max="100" step="1" value="35">
+        <input id="minBrightnessRange" class="slider" type="range" min="0" max="150" step="1" value="35">
       </div>
 
-      <!-- フェードアウト時間 -->
+      <!-- フェードアウト時間 (0 - 180分) -->
       <div class="control-group">
         <div class="control-label">
           <label for="fadeoutRange">フェードアウト時間</label>
@@ -100,9 +118,9 @@
           <button class="preset-chip" type="button" data-minutes="5">5分</button>
           <button class="preset-chip" type="button" data-minutes="15">15分</button>
           <button class="preset-chip" type="button" data-minutes="30">30分</button>
-          <button class="preset-chip" type="button" data-minutes="60">60分</button>
+          <button class="preset-chip" type="button" data-minutes="120">120分</button>
         </div>
-        <input id="fadeoutRange" class="slider" type="range" min="0" max="60" step="1" value="0">
+        <input id="fadeoutRange" class="slider" type="range" min="0" max="180" step="1" value="0">
 
         <div id="fadeStatus" class="fade-status" hidden>
           <span id="fadeRemaining" class="fade-remaining">残り 00:00</span>

@@ -1,18 +1,66 @@
 /**
- * TheFire — Real-time GPU Eulerian Fluid & Combustion Bonfire Simulation
+ * TheFire — Real-time GPU Eulerian Fluid & 1/f Pink-Noise Bonfire Simulation
  *
- * Physics pipeline (WebGL2 / WebGL1 with float FBOs + verified procedural fallback):
- *   1. Pulsating multi-jet fuel & heat injection from crossed firewood crevices + touch impulse
- *   2. Thermal buoyancy, base air entrainment, & organic evening breeze
- *   3. Vorticity (curl) & Vorticity Confinement for sharp, curling flame tongues
- *   4. Divergence & warm-started Jacobi Pressure Projection (open-top boundary)
- *   5. Velocity advection + Clamped MacCormack advection for temperature/fuel/smoke
- *   6. Exothermic combustion & nonlinear radiative cooling (T^3) for crisp flame tips
- *   7. High-DPI bicubic volumetric rendering with exposure-correct filmic blackbody tone
- *      mapping, charred firewood logs, pulsing coal ember bed, and soaring luminous sparks
+ * Physics & visual features:
+ *   - Human-scale campfire convection with fast, nimble flame turnover
+ *   - True 7-octave 1/f pink noise (1/fゆらぎ) driving fuel jets, breeze, & brightness
+ *   - Wide-range dynamic Time Scale (0.05x slow-mo to 8.0x rapid crackle) with adaptive substepping
+ *   - Smooth 3D-like Camera Distance dolly (0.25m close-up to 4.0m distant hearth)
+ *   - WebGL2 / WebGL1 Navier-Stokes fluid solver (buoyancy, entrainment, vorticity confinement,
+ *     warm-started Jacobi pressure projection, Clamped MacCormack advection, combustion & T^3 cooling)
+ *     with automatic procedural fallback for legacy mobile GPUs
  */
 (function (global) {
   'use strict';
+
+  /**
+   * Multi-octave smooth 1/f (pink) noise generator.
+   * Combines 7 octave bands (0.25 Hz .. 16 Hz) weighted by 1 / sqrt(f)
+   * so power spectral density follows S(f) ~ 1/f.
+   */
+  class PinkNoise1D {
+    constructor(baseFreq = 0.28, octaves = 7) {
+      this.octaves = octaves;
+      this.freqs = [];
+      this.amps = [];
+      this.phases = [];
+      this.prev = [];
+      this.next = [];
+      let totalAmp = 0;
+
+      for (let i = 0; i < octaves; i++) {
+        const f = baseFreq * Math.pow(2, i);
+        const a = 1.0 / Math.sqrt(Math.pow(2, i)); // S(f) ~ a^2 / df ~ 1/f
+        this.freqs.push(f);
+        this.amps.push(a);
+        this.phases.push(Math.random());
+        this.prev.push(Math.random());
+        this.next.push(Math.random());
+        totalAmp += a;
+      }
+      this.invNorm = 1.0 / totalAmp;
+      this.value = 0.5;
+    }
+
+    step(dt) {
+      let sum = 0;
+      for (let i = 0; i < this.octaves; i++) {
+        let p = this.phases[i] + dt * this.freqs[i];
+        if (p >= 1.0) {
+          const wraps = Math.floor(p);
+          p -= wraps;
+          this.prev[i] = wraps === 1 ? this.next[i] : Math.random();
+          this.next[i] = Math.random();
+        }
+        this.phases[i] = p;
+        // Smooth Hermite interpolation between random octave knots
+        const u = p * p * (3.0 - 2.0 * p);
+        sum += (this.prev[i] + (this.next[i] - this.prev[i]) * u) * this.amps[i];
+      }
+      this.value = sum * this.invNorm;
+      return this.value;
+    }
+  }
 
   const FULLSCREEN_VERT = `
     attribute vec2 aPos;
@@ -54,7 +102,7 @@
     }
   `;
 
-  // 1. Multi-jet campfire fuel & heat emission + touch impulse
+  // 1. Human-scale campfire multi-jet fuel & heat emission driven by live 1/f pink noise
   const EMIT_STATE_FRAG = `
     precision highp float;
     varying vec2 vUv;
@@ -64,6 +112,8 @@
     uniform float uIntensity;
     uniform float uFireHalfW;
     uniform float uBaseY;
+    uniform vec4 uJetNoise;
+    uniform float uJetCenter;
     uniform vec2 uTouchPos;
     uniform vec2 uTouchVel;
     uniform float uTouchActive;
@@ -76,64 +126,72 @@
       float nx = (vUv.x - 0.5) / uFireHalfW;
       float ax = abs(nx);
 
-      if (uIntensity > 0.004 && ax < 1.15 && vUv.y < uBaseY + 0.20) {
-        float widthScale = mix(0.55, 0.96, clamp(uIntensity, 0.0, 1.0));
+      if (uIntensity > 0.002 && ax < 1.25 && vUv.y < uBaseY + 0.18) {
+        // Campfire footprint scales naturally from tiny ember core (0.32) to roaring hearth (1.08)
+        float widthScale = mix(0.32, 1.05, clamp(uIntensity, 0.0, 1.35) / 1.35);
         float sx = nx / widthScale;
 
-        // Campfire log mound silhouette: taller in center, tapering gracefully at sides
-        float moundTop = uBaseY + 0.052 * exp(-sx * sx * 1.6) * mix(0.65, 1.15, uIntensity);
-        float moundBot = uBaseY - 0.018;
+        // Compact human-scale firewood mound profile
+        float moundTop = uBaseY + 0.038 * exp(-sx * sx * 1.9) * mix(0.55, 1.25, min(uIntensity, 1.4));
+        float moundBot = uBaseY - 0.015;
 
-        float vertMask = smoothstep(moundBot - 0.015, moundBot + 0.022, vUv.y)
-                       * smoothstep(moundTop + 0.032, moundTop - 0.012, vUv.y);
+        float vertMask = smoothstep(moundBot - 0.012, moundBot + 0.018, vUv.y)
+                       * smoothstep(moundTop + 0.026, moundTop - 0.008, vUv.y);
 
-        // Five distinct dancing pyrolysis gas jets emerging from gaps between stacked logs
-        float s1 = sx + 0.62 + 0.07 * sin(uTime * 2.7 + 0.4);
-        float s2 = sx + 0.28 + 0.08 * sin(uTime * 3.3 + 1.9);
-        float s3 = sx + 0.00 + 0.07 * sin(uTime * 2.1 + 3.5);
-        float s4 = sx - 0.29 + 0.08 * sin(uTime * 3.1 + 5.1);
-        float s5 = sx - 0.60 + 0.07 * sin(uTime * 2.5 + 2.2);
+        // Five lively, nimble wood-gap flame tongues modulated by 1/f pink noise
+        float s1 = sx + 0.66 + (uJetNoise.x - 0.5) * 0.16;
+        float s2 = sx + 0.31 + (uJetNoise.y - 0.5) * 0.18;
+        float s3 = sx + 0.00 + (uJetCenter  - 0.5) * 0.16;
+        float s4 = sx - 0.30 + (uJetNoise.z - 0.5) * 0.18;
+        float s5 = sx - 0.64 + (uJetNoise.w - 0.5) * 0.16;
 
-        float j1 = exp(-s1 * s1 * 18.0) * (0.40 + 0.60 * vnoise(vec2(uTime * 2.8, 1.3)));
-        float j2 = exp(-s2 * s2 * 14.0) * (0.55 + 0.45 * vnoise(vec2(uTime * 3.4, 4.7)));
-        float j3 = exp(-s3 * s3 * 12.0) * (0.65 + 0.35 * vnoise(vec2(uTime * 2.6, 8.1)));
-        float j4 = exp(-s4 * s4 * 14.0) * (0.55 + 0.45 * vnoise(vec2(uTime * 3.2, 11.4)));
-        float j5 = exp(-s5 * s5 * 18.0) * (0.38 + 0.62 * vnoise(vec2(uTime * 2.9, 15.2)));
+        // Sharp, distinct flame-lick widths so tongues dance independently instead of merging into a huge pillar
+        float f1 = smoothstep(0.18, 0.85, uJetNoise.x);
+        float f2 = smoothstep(0.14, 0.86, uJetNoise.y);
+        float f3 = smoothstep(0.12, 0.84, uJetCenter);
+        float f4 = smoothstep(0.14, 0.86, uJetNoise.z);
+        float f5 = smoothstep(0.18, 0.85, uJetNoise.w);
 
-        float baseHearth = exp(-sx * sx * 2.8) * 0.34;
-        float jets = baseHearth + j1 * 0.72 + j2 * 1.05 + j3 * 1.20 + j4 * 1.02 + j5 * 0.70;
+        float j1 = exp(-s1 * s1 * 26.0) * (0.20 + 1.05 * f1);
+        float j2 = exp(-s2 * s2 * 22.0) * (0.30 + 1.15 * f2);
+        float j3 = exp(-s3 * s3 * 19.0) * (0.42 + 1.20 * f3);
+        float j4 = exp(-s4 * s4 * 22.0) * (0.30 + 1.15 * f4);
+        float j5 = exp(-s5 * s5 * 26.0) * (0.20 + 1.05 * f5);
 
-        // Turbulent gas pockets rising from wood
-        float n1 = fbm(vec2(sx * 4.5, vUv.y * 14.0 - uTime * 3.2));
-        float n2 = vnoise(vec2(sx * 9.5 + uTime * 1.2, vUv.y * 20.0 - uTime * 5.2));
-        float turb = clamp((n1 * 0.65 + n2 * 0.55) * 1.45, 0.12, 1.55);
+        float baseHearth = exp(-sx * sx * 3.4) * 0.24;
+        float jets = baseHearth + j1 * 0.68 + j2 * 1.02 + j3 * 1.15 + j4 * 1.00 + j5 * 0.68;
 
-        float emit = vertMask * jets * turb * smoothstep(1.12, 0.78, abs(sx));
-        float power = pow(uIntensity, 0.82);
+        // Fine quick pyrolysis pockets from burning bark & wood grain
+        float n1 = fbm(vec2(sx * 6.0, vUv.y * 18.0 - uTime * 5.2));
+        float n2 = vnoise(vec2(sx * 13.0 + uTime * 2.1, vUv.y * 26.0 - uTime * 8.4));
+        float turb = clamp((n1 * 0.60 + n2 * 0.55) * 1.45, 0.08, 1.55);
 
-        float fuelAdd = emit * power * 5.6 * uDt;
-        float tempAdd = emit * mix(0.45, 1.22, power) * 4.8 * uDt;
+        float emit = vertMask * jets * turb * smoothstep(1.15, 0.78, abs(sx));
+        float power = pow(clamp(uIntensity, 0.0, 1.5), 0.86);
+
+        float fuelAdd = emit * power * 5.2 * uDt;
+        float tempAdd = emit * mix(0.32, 1.18, clamp(power, 0.0, 1.25)) * 4.6 * uDt;
 
         st.r = min(1.85, st.r + tempAdd);
         st.g = min(1.55, st.g + fuelAdd);
       }
 
-      // Gentle burst of heat when user stirs the fire
-      if (uTouchActive > 0.5 && uIntensity > 0.05) {
+      // Gentle spark of heat when user stirs the fire
+      if (uTouchActive > 0.5 && uIntensity > 0.02) {
         vec2 diff = vUv - uTouchPos;
         diff.x *= uAspect;
         float d2 = dot(diff, diff);
-        float splash = exp(-d2 * 180.0);
+        float splash = exp(-d2 * 220.0);
         float speed = clamp(length(uTouchVel) * 0.012, 0.0, 1.0);
-        st.r = min(1.8, st.r + splash * speed * 0.32 * uIntensity);
-        st.g = min(1.5, st.g + splash * speed * 0.24 * uIntensity);
+        st.r = min(1.8, st.r + splash * speed * 0.28 * min(uIntensity, 1.2));
+        st.g = min(1.5, st.g + splash * speed * 0.22 * min(uIntensity, 1.2));
       }
 
       gl_FragColor = st;
     }
   `;
 
-  // 2. Buoyancy, inward flame pinching (entrainment), breeze, and touch momentum
+  // 2. Buoyancy, nimble micro-drafts, 1/f breeze gusts, and touch momentum
   const BUOYANCY_FRAG = `
     precision highp float;
     varying vec2 vUv;
@@ -145,6 +203,7 @@
     uniform float uIntensity;
     uniform float uFireHalfW;
     uniform float uBaseY;
+    uniform float uBreeze;
     uniform vec2 uTouchPos;
     uniform vec2 uTouchVel;
     uniform float uTouchActive;
@@ -159,37 +218,36 @@
       float fuel = st.g;
       float smoke = st.b;
 
-      // Strong thermal buoyancy pulls hot flames upward into slender leaping tongues
-      float lift = (temp * 1.18 + fuel * 0.62 - smoke * 0.08) * uBuoyancy;
+      // Brisk small-scale thermal buoyancy
+      float lift = (temp * 1.15 + fuel * 0.58 - smoke * 0.05) * uBuoyancy;
       vel.y += lift * uDt;
 
-      // Gentle campfire air entrainment: shapes a natural multi-tongued pyramid without over-pinching into a single needle
+      // Gentle campfire entrainment pulls outer flame smoothly inward to pointed dancing tips
       float nx = (vUv.x - 0.5) / uFireHalfW;
-      float pinchZone = smoothstep(0.55, 0.04, vUv.y) * smoothstep(2.0, 0.30, abs(nx));
-      vel.x -= sign(nx) * min(abs(nx), 1.0) * pinchZone * uBuoyancy * 0.10 * (0.35 + 0.65 * uIntensity) * uDt;
+      float pinchZone = smoothstep(0.50, 0.04, vUv.y) * smoothstep(2.0, 0.28, abs(nx));
+      vel.x -= sign(nx) * min(abs(nx), 1.0) * pinchZone * uBuoyancy * 0.14 * (0.30 + 0.70 * min(uIntensity, 1.3)) * uDt;
 
-      // Organic evening breeze + multi-scale convective turbulence so flames split into lively dancing tongues
-      float breeze = sin(uTime * 0.62) * 0.48 + sin(uTime * 1.53 + 1.1) * 0.32 + sin(uTime * 2.9 + 2.4) * 0.20;
-      float heightFactor = smoothstep(uBaseY, 0.78, vUv.y);
-      float lateralNoise = (vnoise(vec2(vUv.x * 5.8, vUv.y * 6.5 - uTime * 2.4)) - 0.5) * 2.0;
-      vel.x += (breeze * 0.24 * heightFactor + lateralNoise * 0.62 * (0.20 + temp)) * uBuoyancy * uDt;
+      // Live 1/f pink-noise evening breeze + nimble local air eddies
+      float heightFactor = smoothstep(uBaseY, 0.65, vUv.y);
+      float lateralNoise = (vnoise(vec2(vUv.x * 8.5, vUv.y * 9.5 - uTime * 4.2)) - 0.5) * 2.0;
+      vel.x += (uBreeze * 0.52 * heightFactor + lateralNoise * 0.68 * (0.16 + temp)) * uBuoyancy * uDt;
 
-      // Upward convective impulse inside the hot core
-      float corePush = exp(-nx * nx * 2.5) * smoothstep(uBaseY + 0.12, uBaseY, vUv.y) * smoothstep(uBaseY - 0.03, uBaseY + 0.01, vUv.y);
-      vel.y += corePush * uBuoyancy * 0.58 * uIntensity * uDt;
+      // Local updraft inside log crevices
+      float corePush = exp(-nx * nx * 3.0) * smoothstep(uBaseY + 0.10, uBaseY, vUv.y) * smoothstep(uBaseY - 0.025, uBaseY + 0.01, vUv.y);
+      vel.y += corePush * uBuoyancy * 0.48 * min(uIntensity, 1.35) * uDt;
 
       // User touch / swipe interaction
       if (uTouchActive > 0.5) {
         vec2 diff = vUv - uTouchPos;
         diff.x *= uAspect;
         float d2 = dot(diff, diff);
-        float w = exp(-d2 * 95.0);
+        float w = exp(-d2 * 110.0);
         vel += uTouchVel * w;
       }
 
-      // Viscous air drag & velocity cap
-      vel *= exp(-0.48 * uDt);
-      float maxSpd = uBuoyancy * 2.1;
+      // Slightly higher viscous air drag keeps campfire nimble instead of giant inertial plumes
+      vel *= exp(-0.85 * uDt);
+      float maxSpd = uBuoyancy * 2.0;
       float spd = length(vel);
       if (spd > maxSpd) {
         vel = vel * (maxSpd / spd);
@@ -220,7 +278,7 @@
     }
   `;
 
-  // 4. Vorticity confinement (carves dynamic licking flame curls & wisps)
+  // 4. Vorticity confinement (carves quick, nimble licking flame tips)
   const VORTICITY_FRAG = `
     precision highp float;
     varying vec2 vUv;
@@ -243,8 +301,8 @@
       force = (force / len) * cC * uCurlStrength;
 
       vec4 st = texture2D(uState, vUv);
-      float mask = smoothstep(0.03, 0.32, st.r + st.g + st.b * 0.4);
-      mask *= smoothstep(1.0, 0.88, vUv.y);
+      float mask = smoothstep(0.04, 0.34, st.r + st.g + st.b * 0.35);
+      mask *= smoothstep(1.0, 0.86, vUv.y);
 
       vec2 vel = texture2D(uVelocity, vUv).xy;
       vel += force * mask * uDt;
@@ -358,7 +416,7 @@
     }
   `;
 
-  // 9b. Clamped MacCormack Advection (sharp, crisp flame ribbons)
+  // 9b. Clamped MacCormack Advection
   const MACCORMACK_FRAG = `
     precision highp float;
     varying vec2 vUv;
@@ -398,7 +456,7 @@
     }
   `;
 
-  // 10. Exothermic Combustion & Radiative Cooling (T^3 + edge crispness)
+  // 10. Crisp Campfire Combustion & Short-Timescale Radiative Cooling
   const COMBUSTION_FRAG = `
     precision highp float;
     varying vec2 vUv;
@@ -412,67 +470,67 @@
       float fuel = st.g;
       float smoke = st.b;
 
-      // Fuel ignites rapidly into incandescent heat
-      float ignition = smoothstep(0.05, 0.30, temp + 0.14);
-      float burn = min(fuel, fuel * 4.4 * uDt) * ignition;
+      // Rapid wood-gas combustion creates lively, short-lived campfire licks
+      float ignition = smoothstep(0.04, 0.28, temp + 0.14);
+      float burn = min(fuel, fuel * 5.6 * uDt) * ignition;
       fuel -= burn;
-      temp += burn * 1.45;
-      smoke = min(1.0, smoke + burn * 0.28);
+      temp += burn * 1.42;
+      smoke = min(0.85, smoke + burn * 0.18);
 
-      // Faster radiative cooling at high T + convective cooling at flanks gives sharp pointed flame tips
-      float coolRate = uCooling * (0.58 * temp + 1.75 * temp * temp * temp);
+      // Faster convective + radiative cooling keeps flames human-scaled & sharply pointed
+      float coolRate = uCooling * (0.95 * temp + 2.25 * temp * temp * temp);
       temp = max(0.0, temp - coolRate * uDt);
 
-      float topFade = smoothstep(1.0, 0.88, vUv.y);
-      temp *= mix(0.86, 1.0, topFade);
-      fuel *= exp(-1.15 * uDt) * mix(0.85, 1.0, topFade);
-      smoke *= exp(-1.35 * uDt) * mix(0.82, 1.0, topFade);
+      float topFade = smoothstep(1.0, 0.86, vUv.y);
+      temp *= mix(0.82, 1.0, topFade);
+      fuel *= exp(-1.65 * uDt) * mix(0.82, 1.0, topFade);
+      smoke *= exp(-1.95 * uDt) * mix(0.80, 1.0, topFade);
 
       gl_FragColor = vec4(temp, fuel, smoke, 1.0);
     }
   `;
 
-  // Shared rendering helpers: Vivid Blackbody Ramp, Exposure-Correct ACES, Charred Logs
+  // Shared rendering helpers
   const RENDER_HELPERS_GLSL = `
     vec3 acesToneMap(vec3 x) {
       return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
     }
 
-    // Vivid HDR natural wood bonfire blackbody curve (linear HDR radiance)
+    // Crisp wood-campfire blackbody radiance (clean golden-orange licks, minimal murky brown)
     vec3 naturalFireRamp(float t) {
       vec3 c0 = vec3(0.0);
-      vec3 c1 = vec3(0.55, 0.02, 0.001);  // deep luminous crimson edge
-      vec3 c2 = vec3(1.65, 0.24, 0.005);  // blazing flame red-orange
-      vec3 c3 = vec3(2.85, 0.92, 0.06);   // rich glowing bonfire orange
-      vec3 c4 = vec3(4.20, 2.45, 0.42);   // brilliant golden yellow
-      vec3 c5 = vec3(6.20, 5.10, 2.75);   // incandescent cream-white core
+      vec3 c1 = vec3(0.62, 0.025, 0.001); // translucent crimson tip
+      vec3 c2 = vec3(1.85, 0.28, 0.006);  // vivid wood-flame orange-red
+      vec3 c3 = vec3(3.15, 1.08, 0.07);   // warm campfire amber-orange
+      vec3 c4 = vec3(4.55, 2.72, 0.50);   // bright golden flame
+      vec3 c5 = vec3(6.40, 5.35, 3.05);   // incandescent cream-white core
 
-      vec3 col = mix(c0, c1, smoothstep(0.09, 0.22, t));
-      col = mix(col, c2, smoothstep(0.20, 0.42, t));
-      col = mix(col, c3, smoothstep(0.40, 0.70, t));
-      col = mix(col, c4, smoothstep(0.68, 1.04, t));
-      col = mix(col, c5, smoothstep(1.00, 1.45, t));
+      vec3 col = mix(c0, c1, smoothstep(0.11, 0.24, t));
+      col = mix(col, c2, smoothstep(0.22, 0.44, t));
+      col = mix(col, c3, smoothstep(0.42, 0.72, t));
+      col = mix(col, c4, smoothstep(0.70, 1.05, t));
+      col = mix(col, c5, smoothstep(1.02, 1.46, t));
       return col;
     }
 
-    // Vivid HDR thermal color ramp for arbitrary user colors
+    // Vivid thermal ramp for arbitrary user colors
     vec3 customFireRamp(float t, vec3 base) {
       vec3 b = max(base, vec3(0.01));
       float maxC = max(b.r, max(b.g, b.b));
       vec3 normB = b / max(maxC, 0.001);
 
       vec3 c0 = vec3(0.0);
-      vec3 c1 = pow(normB, vec3(2.4)) * 0.65;
-      vec3 c2 = pow(normB, vec3(1.45)) * 1.85;
-      vec3 c3 = mix(normB, vec3(1.0, 0.97, 0.90), 0.24) * 3.10;
-      vec3 c4 = mix(normB, vec3(1.0, 0.99, 0.95), 0.62) * 4.50;
-      vec3 c5 = mix(vec3(1.0), normB, 0.14) * 6.20;
+      vec3 c1 = pow(normB, vec3(2.4)) * 0.70;
+      vec3 c2 = pow(normB, vec3(1.42)) * 2.00;
+      vec3 c3 = mix(normB, vec3(1.0, 0.97, 0.90), 0.24) * 3.30;
+      vec3 c4 = mix(normB, vec3(1.0, 0.99, 0.95), 0.62) * 4.70;
+      vec3 c5 = mix(vec3(1.0), normB, 0.14) * 6.40;
 
-      vec3 col = mix(c0, c1, smoothstep(0.09, 0.22, t));
-      col = mix(col, c2, smoothstep(0.20, 0.42, t));
-      col = mix(col, c3, smoothstep(0.40, 0.70, t));
-      col = mix(col, c4, smoothstep(0.68, 1.04, t));
-      col = mix(col, c5, smoothstep(1.00, 1.45, t));
+      vec3 col = mix(c0, c1, smoothstep(0.11, 0.24, t));
+      col = mix(col, c2, smoothstep(0.22, 0.44, t));
+      col = mix(col, c3, smoothstep(0.42, 0.72, t));
+      col = mix(col, c4, smoothstep(0.70, 1.05, t));
+      col = mix(col, c5, smoothstep(1.02, 1.46, t));
       return col;
     }
 
@@ -482,19 +540,16 @@
       return mix(cus, nat, isNatural);
     }
 
-    // Apply brightness via exposure + gentle ceiling so dim flames stay vivid orange-gold, never muddy gray
+    // Exposure-based brightness scaling supporting 0% .. 150%
     vec3 exposeAndToneMap(vec3 hdrCol, float brightness) {
-      float b = clamp(brightness, 0.0, 1.0);
+      float b = clamp(brightness, 0.0, 1.5);
       if (b <= 0.0005) return vec3(0.0);
-      // Pre-tonemap exposure keeps bright highlights warm & colorful instead of desaturated gray
-      float preExposure = mix(0.28, 1.25, pow(b, 0.72));
+      float preExposure = mix(0.22, 1.25, pow(min(b, 1.0), 0.72)) * (b > 1.0 ? (1.0 + (b - 1.0) * 1.45) : 1.0);
       vec3 mapped = acesToneMap(hdrCol * preExposure);
-      // Post-tonemap ceiling guarantees maxBrightness genuinely dims the phone screen in a dark bedroom
-      float postCeiling = pow(b, 0.68);
-      return mapped * postCeiling;
+      float postCeiling = pow(min(b, 1.0), 0.68) * (b > 1.0 ? (1.0 + (b - 1.0) * 0.25) : 1.0);
+      return clamp(mapped * postCeiling, 0.0, 1.0);
     }
 
-    // Distance to a 2D line segment (for organic charred wood logs)
     float sdSegment(vec2 p, vec2 a, vec2 b, out float along) {
       vec2 pa = p - a;
       vec2 ba = b - a;
@@ -502,46 +557,44 @@
       return length(pa - ba * along);
     }
 
-    // Evaluate charred campfire log stack + glowing coal embers
-    // Returns vec3(logAlpha, emberGlowTemp, charcoalShade)
-    vec3 evalCampfireLogs(vec2 uv, float fireHalfW, float baseY, float aspect, float time, float emberHeat) {
-      vec2 p = vec2((uv.x - 0.5) / fireHalfW, (uv.y - baseY) / (fireHalfW * aspect));
+    // Sculpted campfire firewood logs & pulsing ember bed (evaluated in simulation UV space)
+    vec3 evalCampfireLogs(vec2 simUv, float fireHalfW, float baseY, float aspect, float time, float emberHeat) {
+      vec2 p = vec2((simUv.x - 0.5) / fireHalfW, (simUv.y - baseY) / (fireHalfW * aspect));
 
-      if (abs(p.x) > 1.30 || p.y < -0.52 || p.y > 0.55) {
+      if (abs(p.x) > 1.32 || p.y < -0.52 || p.y > 0.52) {
         return vec3(0.0);
       }
 
-      float grain = fbm(p * vec2(11.0, 22.0) + vec2(3.1, 1.7));
-      float cracks = vnoise(p * vec2(26.0, 34.0) + vec2(0.0, -time * 0.05));
-      float rough = (grain - 0.5) * 0.022;
+      float grain = fbm(p * vec2(12.0, 24.0) + vec2(3.1, 1.7));
+      float cracks = vnoise(p * vec2(28.0, 36.0) + vec2(0.0, -time * 0.05));
+      float rough = (grain - 0.5) * 0.020;
 
       float h1, h2, h3, h4;
-      float d1 = sdSegment(p, vec2(-0.88, -0.15), vec2(0.26, 0.14), h1) - 0.068 + rough;
-      float d2 = sdSegment(p, vec2(0.90, -0.14), vec2(-0.24, 0.13), h2) - 0.066 + rough;
-      float d3 = sdSegment(p, vec2(-0.76, -0.22), vec2(0.42, -0.05), h3) - 0.072 + rough;
-      float d4 = sdSegment(p, vec2(0.78, -0.21), vec2(-0.40, -0.03), h4) - 0.070 + rough;
+      float d1 = sdSegment(p, vec2(-0.86, -0.14), vec2(0.25, 0.13), h1) - 0.064 + rough;
+      float d2 = sdSegment(p, vec2(0.88, -0.13), vec2(-0.23, 0.12), h2) - 0.062 + rough;
+      float d3 = sdSegment(p, vec2(-0.74, -0.21), vec2(0.40, -0.05), h3) - 0.068 + rough;
+      float d4 = sdSegment(p, vec2(0.76, -0.20), vec2(-0.38, -0.03), h4) - 0.066 + rough;
 
       float d = min(min(d1, d2), min(d3, d4));
       float logAlpha = smoothstep(0.014, -0.008, d);
 
-      // Glowing ember bed nestled under and between the logs
-      float bedDist = length(vec2(p.x * 0.96, (p.y + 0.17) * 3.1));
-      float bedNoise = fbm(vec2(p.x * 11.0, p.y * 18.0) + vec2(time * 0.04, -time * 0.03));
-      float pulse = 0.78 + 0.22 * sin(time * 1.35 + p.x * 4.5 + bedNoise * 5.0);
-      float coalBed = smoothstep(0.92, 0.18, bedDist) * smoothstep(0.32, 0.78, bedNoise) * pulse;
+      // Glowing oak coal bed nestled between and beneath logs
+      float bedDist = length(vec2(p.x * 0.98, (p.y + 0.16) * 3.1));
+      float bedNoise = fbm(vec2(p.x * 12.0, p.y * 19.0) + vec2(time * 0.04, -time * 0.03));
+      float pulse = 0.78 + 0.22 * sin(time * 1.4 + p.x * 4.5 + bedNoise * 5.0);
+      float coalBed = smoothstep(0.90, 0.16, bedDist) * smoothstep(0.32, 0.78, bedNoise) * pulse;
 
-      // Incandescent fissures & glowing undersides on the inner charred wood
-      float innerHeat = exp(-p.x * p.x * 2.3) * smoothstep(-0.32, 0.14, p.y);
-      float crackGlow = logAlpha * innerHeat * smoothstep(0.50, 0.86, cracks * 0.65 + grain * 0.48) * pulse;
-      float rimGlow = smoothstep(0.022, 0.0, abs(d)) * innerHeat * 0.75 * pulse;
+      float innerHeat = exp(-p.x * p.x * 2.4) * smoothstep(-0.32, 0.14, p.y);
+      float crackGlow = logAlpha * innerHeat * smoothstep(0.48, 0.85, cracks * 0.65 + grain * 0.48) * pulse;
+      float rimGlow = smoothstep(0.022, 0.0, abs(d)) * innerHeat * 0.78 * pulse;
 
-      float totalEmber = (coalBed * 0.72 + crackGlow * 0.95 + rimGlow * 0.65) * emberHeat;
+      float totalEmber = (coalBed * 0.76 + crackGlow * 0.98 + rimGlow * 0.68) * emberHeat;
       float shade = 0.4 + 0.6 * grain;
       return vec3(logAlpha, totalEmber, shade);
     }
   `;
 
-  // 11. High-DPI Final Volumetric Fire Display Shader (uses GPU fluid state)
+  // 11. High-DPI Final Volumetric Fire Display Shader with Camera Distance Projection
   const DISPLAY_FRAG = `
     precision highp float;
     varying vec2 vUv;
@@ -552,6 +605,8 @@
     uniform float uAspect;
     uniform float uFireHalfW;
     uniform float uBaseY;
+    uniform float uCameraDist;
+    uniform float uAnchorY;
     uniform vec3 uBaseColor;
     uniform float uIsNatural;
     uniform float uBrightness;
@@ -560,8 +615,11 @@
     ${NOISE_GLSL}
     ${RENDER_HELPERS_GLSL}
 
-    // 4-tap Catmull-Rom-inspired smooth bicubic sampling (zero blocky grid artifacts!)
+    // 4-tap Catmull-Rom smooth bicubic sampler (silky even at 0.25m close-up!)
     vec4 sampleBicubic(sampler2D tex, vec2 uv, vec2 texel) {
+      if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return vec4(0.0);
+      }
       vec2 pos = uv / texel - 0.5;
       vec2 f = fract(pos);
       vec2 i = floor(pos);
@@ -581,67 +639,78 @@
       vec4 t01 = texture2D(tex, clamp(vec2(o0.x, o1.y), vec2(0.0), vec2(1.0)));
       vec4 t11 = texture2D(tex, clamp(vec2(o1.x, o1.y), vec2(0.0), vec2(1.0)));
 
+      // Smooth fade at simulation domain borders so distant camera never sees a hard box edge
+      float edge = smoothstep(0.0, 0.03, uv.x) * smoothstep(1.0, 0.97, uv.x)
+                 * smoothstep(0.0, 0.02, uv.y) * smoothstep(1.0, 0.95, uv.y);
+
       return max(vec4(0.0),
-        (t00 * s0.x + t10 * s1.x) * s0.y +
-        (t01 * s0.x + t11 * s1.x) * s1.y
+        ((t00 * s0.x + t10 * s1.x) * s0.y +
+         (t01 * s0.x + t11 * s1.x) * s1.y) * edge
       );
     }
 
     void main() {
-      vec4 coarseSt = sampleBicubic(uState, vUv, uSimTexel);
-      vec2 vel = texture2D(uVelocity, vUv).xy;
+      // Camera projection: map screen UV -> local campfire simulation UV
+      vec2 simUv = vec2(
+        (vUv.x - 0.5) * uCameraDist + 0.5,
+        (vUv.y - uAnchorY) * uCameraDist + uBaseY
+      );
 
-      // Delicate fluid-advected micro-shimmer for silky Retina flame ribbons
+      vec4 coarseSt = sampleBicubic(uState, simUv, uSimTexel);
+      vec2 vel = (simUv.x >= 0.0 && simUv.x <= 1.0 && simUv.y >= 0.0 && simUv.y <= 1.0)
+               ? texture2D(uVelocity, simUv).xy
+               : vec2(0.0);
+
+      // High-frequency advected micro-shimmer keeps close-ups razor-sharp and lively
       float heatMask = smoothstep(0.05, 0.45, coarseSt.r + coarseSt.g * 0.4);
-      vec2 shimmerUv = vec2(vUv.x * uAspect * 5.2, vUv.y * 5.2 - uTime * 3.4);
+      vec2 shimmerUv = vec2(simUv.x * uAspect * 6.5, simUv.y * 6.5 - uTime * 5.0);
       vec2 microOffset = vec2(
         fbm(shimmerUv) - 0.5,
         fbm(shimmerUv + vec2(13.7, 5.3)) - 0.5
-      ) * 0.0085 * heatMask;
+      ) * 0.0080 * heatMask;
 
-      vec4 st = sampleBicubic(uState, vUv + microOffset, uSimTexel);
+      vec4 st = sampleBicubic(uState, simUv + microOffset, uSimTexel);
       float temp = st.r;
       float fuel = st.g;
       float smoke = st.b;
 
-      // Carve crisp flickering micro-tongues along outer flame edges
-      float detail = fbm(vec2(vUv.x * uAspect * 8.0, vUv.y * 7.5 - uTime * 4.2) - vel * 0.0018);
-      float edgeSculpt = (detail - 0.48) * 0.22 * smoothstep(0.05, 0.52, temp);
+      // Crisp micro-flicker tongues along outer edges
+      float detail = fbm(vec2(simUv.x * uAspect * 10.0, simUv.y * 9.5 - uTime * 6.2) - vel * 0.0014);
+      float edgeSculpt = (detail - 0.49) * 0.24 * smoothstep(0.05, 0.50, temp);
       float effectiveTemp = max(0.0, temp + edgeSculpt);
-      // Slight hot core boost where unburned wood gas ignites cleanly
-      effectiveTemp += fuel * 0.16 * smoothstep(0.18, 0.65, temp);
+      effectiveTemp += fuel * 0.15 * smoothstep(0.18, 0.65, temp);
 
-      // Wide, subtle ambient night firelight glow
-      vec2 glowDelta = vec2((vUv.x - 0.5) * uAspect, (vUv.y - (uBaseY + 0.18 * (0.4 + 0.6 * uIntensity))) * 0.85);
+      // Ambient night firelight radiating seamlessly across the full viewport (attenuates gently with distance)
+      float fireCenterY = uAnchorY + (0.14 * (0.4 + 0.6 * min(uIntensity, 1.3))) / uCameraDist;
+      vec2 glowDelta = vec2((vUv.x - 0.5) * uAspect, (vUv.y - fireCenterY) * 0.88) * pow(uCameraDist, 0.55);
       float glowDist = length(glowDelta);
-      float ambientGlow = exp(-glowDist * 2.8) * (0.09 + 0.14 * uIntensity) * (0.30 + 0.70 * uEmberHeat);
-      vec3 glowCol = fireColor(0.40, uBaseColor, uIsNatural) * ambientGlow;
+      float ambientGlow = exp(-glowDist * 3.0) * (0.08 + 0.13 * min(uIntensity, 1.4)) * (0.30 + 0.70 * uEmberHeat);
+      vec3 glowCol = fireColor(0.42, uBaseColor, uIsNatural) * ambientGlow;
 
-      // Subtle fire-lit warm smoke wisps rising above flames
-      float smokeVis = smoothstep(0.06, 0.85, smoke) * (1.0 - smoothstep(0.22, 0.65, effectiveTemp));
-      vec3 smokeCol = fireColor(0.24, uBaseColor, uIsNatural) * smokeVis * 0.09 * exp(-glowDist * 1.5);
+      // Light wispy smoke catching warm underlight
+      float smokeVis = smoothstep(0.08, 0.85, smoke) * (1.0 - smoothstep(0.20, 0.58, effectiveTemp));
+      vec3 smokeCol = fireColor(0.24, uBaseColor, uIsNatural) * smokeVis * 0.06 * exp(-glowDist * 1.6);
 
-      // Warm hearth ground reflection directly beneath the logs
-      vec2 floorDelta = vec2((vUv.x - 0.5) / (uFireHalfW * 1.32), (vUv.y - (uBaseY - 0.032)) / 0.065);
-      float floorGlow = exp(-dot(floorDelta, floorDelta) * 1.55) * 0.22 * uEmberHeat;
-      vec3 floorCol = fireColor(0.34, uBaseColor, uIsNatural) * floorGlow;
+      // Warm ground reflection beneath the firewood logs
+      vec2 floorDelta = vec2((simUv.x - 0.5) / (uFireHalfW * 1.45), (simUv.y - (uBaseY - 0.032)) / 0.068);
+      float floorGlow = exp(-dot(floorDelta, floorDelta) * 1.50) * 0.24 * uEmberHeat;
+      vec3 floorCol = fireColor(0.35, uBaseColor, uIsNatural) * floorGlow;
 
-      // Charred firewood logs & glowing coal embers
-      vec3 logInfo = evalCampfireLogs(vUv, uFireHalfW, uBaseY, uAspect, uTime, uEmberHeat);
+      // Sculpted firewood logs & glowing coal embers
+      vec3 logInfo = evalCampfireLogs(simUv, uFireHalfW, uBaseY, uAspect, uTime, uEmberHeat);
       float logAlpha = logInfo.x;
       float emberTemp = logInfo.y;
       float logShade = logInfo.z;
 
-      // Crisp luminous flame emission
+      // Crisp luminous campfire flame emission
       vec3 flameCol = fireColor(effectiveTemp, uBaseColor, uIsNatural);
-      float flameOpacity = smoothstep(0.10, 0.40, effectiveTemp);
+      float flameOpacity = smoothstep(0.11, 0.42, effectiveTemp);
 
       vec3 col = glowCol + smokeCol + floorCol;
 
-      // Dark charred wood silhouettes with warm inner firelight reflection
       vec3 charcoalCol = vec3(0.014, 0.010, 0.008) * logShade
-                       + fireColor(0.32, uBaseColor, uIsNatural) * 0.032 * logShade * uEmberHeat;
-      vec3 emberCol = fireColor(emberTemp * 0.92, uBaseColor, uIsNatural) * 0.72;
+                       + fireColor(0.32, uBaseColor, uIsNatural) * 0.035 * logShade * uEmberHeat;
+      vec3 emberCol = fireColor(emberTemp * 0.94, uBaseColor, uIsNatural) * 0.76;
 
       col = mix(col, charcoalCol, logAlpha * (1.0 - flameOpacity * 0.88));
       col += emberCol;
@@ -653,7 +722,7 @@
     }
   `;
 
-  // Fallback Procedural Volumetric Fluid-Turbulence Fire Shader (zero float FBOs needed!)
+  // Fallback Procedural Volumetric Fire Shader (supports camera distance & 1/f flicker too!)
   const FALLBACK_FIRE_FRAG = `
     precision highp float;
     varying vec2 vUv;
@@ -661,11 +730,14 @@
     uniform float uAspect;
     uniform float uFireHalfW;
     uniform float uBaseY;
+    uniform float uCameraDist;
+    uniform float uAnchorY;
     uniform vec3 uBaseColor;
     uniform float uIsNatural;
     uniform float uBrightness;
     uniform float uEmberHeat;
     uniform float uIntensity;
+    uniform float uBreeze;
     uniform vec2 uTouchPos;
     uniform vec2 uTouchVel;
     uniform float uTouchActive;
@@ -673,49 +745,55 @@
     ${RENDER_HELPERS_GLSL}
 
     void main() {
-      float nx = (vUv.x - 0.5) / uFireHalfW;
-      float ny = max(0.0, vUv.y - uBaseY);
+      vec2 simUv = vec2(
+        (vUv.x - 0.5) * uCameraDist + 0.5,
+        (vUv.y - uAnchorY) * uCameraDist + uBaseY
+      );
 
-      float sway = (sin(uTime * 0.85) * 0.09 + sin(uTime * 1.9 + 1.2) * 0.04) * ny * 2.2;
+      float nx = (simUv.x - 0.5) / uFireHalfW;
+      float ny = max(0.0, simUv.y - uBaseY);
+
+      float sway = (uBreeze * 0.22 + sin(uTime * 2.4 + 1.2) * 0.04) * ny * 2.2;
       if (uTouchActive > 0.5) {
-        vec2 td = vUv - uTouchPos;
+        vec2 td = simUv - uTouchPos;
         td.x *= uAspect;
-        sway += clamp(uTouchVel.x * 0.0012, -0.35, 0.35) * exp(-dot(td, td) * 24.0);
+        sway += clamp(uTouchVel.x * 0.0012, -0.35, 0.35) * exp(-dot(td, td) * 28.0);
       }
 
       vec2 q = vec2(nx - sway, ny);
-      float fireH = mix(0.24, 0.82, uIntensity);
+      float fireH = mix(0.16, 0.72, clamp(uIntensity, 0.0, 1.4) / 1.4);
 
-      float t = uTime * mix(1.4, 2.5, uIntensity);
+      float t = uTime * mix(2.2, 3.8, min(uIntensity, 1.3));
       vec2 w1 = vec2(
-        fbm(vec2(q.x * 2.4, q.y * 3.4 - t * 1.05)),
-        fbm(vec2(q.x * 2.4 + 5.2, q.y * 3.4 - t * 1.25))
+        fbm(vec2(q.x * 3.0, q.y * 4.2 - t * 1.15)),
+        fbm(vec2(q.x * 3.0 + 5.2, q.y * 4.2 - t * 1.35))
       ) - 0.5;
 
-      vec2 warped = q + w1 * vec2(0.55, 0.30) * smoothstep(0.0, 0.32, ny);
-      float nFine = fbm(vec2(warped.x * 4.6, warped.y * 6.0 - t * 1.75));
+      vec2 warped = q + w1 * vec2(0.58, 0.30) * smoothstep(0.0, 0.28, ny);
+      float nFine = fbm(vec2(warped.x * 5.8, warped.y * 7.2 - t * 1.95));
 
-      float widthAtY = mix(0.92, 0.18, clamp(ny / max(fireH, 0.1), 0.0, 1.0));
-      float radial = abs(warped.x) / max(widthAtY, 0.10);
-      float heightDecay = 1.0 - smoothstep(0.0, fireH * (0.82 + 0.48 * nFine), ny);
+      float widthAtY = mix(0.86, 0.14, clamp(ny / max(fireH, 0.08), 0.0, 1.0));
+      float radial = abs(warped.x) / max(widthAtY, 0.09);
+      float heightDecay = 1.0 - smoothstep(0.0, fireH * (0.78 + 0.50 * nFine), ny);
 
-      float temp = heightDecay * exp(-radial * radial * 1.55) * (0.72 + 0.92 * nFine) * (0.58 + 0.88 * uIntensity);
-      temp *= smoothstep(uBaseY - 0.025, uBaseY + 0.04, vUv.y);
-      temp = max(0.0, temp - 0.10);
+      float temp = heightDecay * exp(-radial * radial * 1.65) * (0.72 + 0.92 * nFine) * (0.48 + 0.92 * min(uIntensity, 1.4));
+      temp *= smoothstep(uBaseY - 0.02, uBaseY + 0.035, simUv.y);
+      temp = max(0.0, temp - 0.12);
 
-      vec2 glowDelta = vec2((vUv.x - 0.5) * uAspect, (vUv.y - (uBaseY + 0.18 * uIntensity)) * 0.85);
+      float fireCenterY = uAnchorY + (0.14 * min(uIntensity, 1.3)) / uCameraDist;
+      vec2 glowDelta = vec2((vUv.x - 0.5) * uAspect, (vUv.y - fireCenterY) * 0.88) * pow(uCameraDist, 0.55);
       float glowDist = length(glowDelta);
-      vec3 glowCol = fireColor(0.40, uBaseColor, uIsNatural) * exp(-glowDist * 2.8) * (0.09 + 0.14 * uIntensity) * uEmberHeat;
+      vec3 glowCol = fireColor(0.42, uBaseColor, uIsNatural) * exp(-glowDist * 3.0) * (0.08 + 0.13 * min(uIntensity, 1.4)) * uEmberHeat;
 
-      vec3 logInfo = evalCampfireLogs(vUv, uFireHalfW, uBaseY, uAspect, uTime, uEmberHeat);
+      vec3 logInfo = evalCampfireLogs(simUv, uFireHalfW, uBaseY, uAspect, uTime, uEmberHeat);
       vec3 flameCol = fireColor(temp, uBaseColor, uIsNatural);
-      float flameOpacity = smoothstep(0.10, 0.40, temp);
+      float flameOpacity = smoothstep(0.11, 0.42, temp);
 
       vec3 col = glowCol;
       vec3 charcoalCol = vec3(0.014, 0.010, 0.008) * logInfo.z
-                       + fireColor(0.32, uBaseColor, uIsNatural) * 0.032 * logInfo.z * uEmberHeat;
+                       + fireColor(0.32, uBaseColor, uIsNatural) * 0.035 * logInfo.z * uEmberHeat;
       col = mix(col, charcoalCol, logInfo.x * (1.0 - flameOpacity * 0.88));
-      col += fireColor(logInfo.y * 0.92, uBaseColor, uIsNatural) * 0.72;
+      col += fireColor(logInfo.y * 0.94, uBaseColor, uIsNatural) * 0.76;
       col += flameCol;
 
       col = exposeAndToneMap(col, uBrightness);
@@ -724,7 +802,7 @@
     }
   `;
 
-  // 12. Additive Glowing Sparks / Embers Particle Shaders
+  // 12. Additive Glowing Sparks / Embers Particle Shaders (with camera distance projection!)
   const SPARK_VERT = `
     attribute vec2 aPos;
     attribute float aSize;
@@ -733,12 +811,19 @@
     varying float vHeat;
     varying float vAlpha;
     uniform float uDpr;
+    uniform float uCameraDist;
+    uniform float uAnchorY;
+    uniform float uBaseY;
 
     void main() {
       vHeat = aHeat;
       vAlpha = aAlpha;
-      gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0);
-      gl_PointSize = max(2.0, aSize * uDpr);
+      vec2 screenPos = vec2(
+        (aPos.x - 0.5) / uCameraDist + 0.5,
+        (aPos.y - uBaseY) / uCameraDist + uAnchorY
+      );
+      gl_Position = vec4(screenPos * 2.0 - 1.0, 0.0, 1.0);
+      gl_PointSize = max(1.5, (aSize / pow(uCameraDist, 0.65)) * uDpr);
     }
   `;
 
@@ -765,7 +850,8 @@
       vec3 cusCol = mix(b, vec3(1.0, 0.96, 0.88), clamp(vHeat * 0.78, 0.0, 1.0));
       vec3 col = mix(cusCol, natCol, uIsNatural);
 
-      float lumScale = pow(clamp(uBrightness, 0.0, 1.0), 0.72);
+      float bClamped = clamp(uBrightness, 0.0, 1.5);
+      float lumScale = pow(min(bClamped, 1.0), 0.72) * (bClamped > 1.0 ? (1.0 + (bClamped - 1.0) * 0.4) : 1.0);
       float a = shape * vAlpha * lumScale;
       gl_FragColor = vec4(col * a * 1.65, a);
     }
@@ -792,12 +878,15 @@
       this.useFluidSim = false;
       this.contextLost = false;
 
-      // Simulation parameters
+      // User parameters (defaults calibrated to a cozy human-scale campfire!)
       this.baseColor = [1.0, 0.415, 0.078]; // #ff6a14
       this.isNaturalColor = 1.0;
-      this.intensity = 0.68;
-      this.minBrightness = 0.35;
-      this.maxBrightness = 0.95;
+      this.intensity = 0.55;         // 0.01 .. 1.50
+      this.timeScale = 1.0;          // 0.05 .. 8.00 (1.0 = snappy human campfire)
+      this.targetCameraDist = 1.25;  // 0.25 .. 4.00 (meters-like zoom factor)
+      this.cameraDist = 1.25;
+      this.minBrightness = 0.35;     // 0.00 .. 1.50
+      this.maxBrightness = 0.95;     // 0.01 .. 1.50
       this.fadeIntensityMul = 1.0;
       this.fadeEmberMul = 1.0;
       this.fadeBrightnessMul = 1.0;
@@ -810,9 +899,23 @@
       this.aspect = 1;
       this.simW = 148;
       this.simH = 296;
-      this.fireHalfW = 0.34;
+      this.fireHalfW = 0.32;
       this.baseY = 0.075;
-      this.currentBrightness = 0.75;
+      this.anchorY = 0.14;
+      this.currentBrightness = 0.72;
+
+      // Live 1/f pink noise generators (all advance proportionally to timeScale!)
+      this.brightnessPink = new PinkNoise1D(0.32, 7);
+      this.breezePink = new PinkNoise1D(0.24, 6);
+      this.jetPinks = [
+        new PinkNoise1D(0.42, 7),
+        new PinkNoise1D(0.46, 7),
+        new PinkNoise1D(0.40, 7),
+        new PinkNoise1D(0.45, 7),
+        new PinkNoise1D(0.43, 7),
+      ];
+      this.jetVals = [0.5, 0.5, 0.5, 0.5, 0.5];
+      this.breezeVal = 0.0;
 
       // Touch interaction state
       this.touchActive = false;
@@ -1070,17 +1173,31 @@
       this._warmupFluid();
     }
 
-    // Pre-warm the fluid convection column so frame 1 is already a natural roaring bonfire (no startup mushroom!)
+    _stepPinkNoises(simDt) {
+      for (let i = 0; i < 5; i++) {
+        this.jetVals[i] = this.jetPinks[i].step(simDt);
+      }
+      this.breezeVal = (this.breezePink.step(simDt) - 0.5) * 2.0;
+      this.brightnessPink.step(simDt);
+    }
+
     _warmupFluid() {
       if (!this.useFluidSim || !this.fbos) return;
       const gl = this.gl;
       gl.disable(gl.BLEND);
       const effInt = this.intensity * this.fadeIntensityMul;
-      const stepDt = 0.028;
-      for (let i = 0; i < 115; i++) {
+      const stepDt = 0.022;
+      for (let i = 0; i < 110; i++) {
         this.time += stepDt;
-        this._stepFluid(stepDt, effInt);
+        this._stepPinkNoises(stepDt);
+        this._stepFluid(stepDt, effInt, 12);
       }
+    }
+
+    _computeAnchorY(dist) {
+      // Smooth framing: close-up fills from very bottom, distant hearth sits calmly in lower-middle night
+      const t = Math.max(0.0, Math.min(1.0, (dist - 0.30) / 3.40));
+      return 0.045 + 0.245 * Math.pow(t, 0.72);
     }
 
     resize() {
@@ -1097,10 +1214,11 @@
       this.canvas.width = this.width;
       this.canvas.height = this.height;
 
-      this.fireHalfW = Math.min(0.41, 0.34 / Math.max(this.aspect, 0.45));
-      this.baseY = this.aspect < 0.85 ? 0.085 : 0.075;
+      // Human-scale campfire width in simulation domain
+      this.fireHalfW = Math.min(0.35, 0.30 / Math.max(this.aspect, 0.45));
+      this.baseY = 0.085;
+      this.anchorY = this._computeAnchorY(this.cameraDist);
 
-      // Crisp square-cell simulation grid optimized for mobile 60fps
       let nextW, nextH;
       if (this.aspect < 1) {
         nextH = 304;
@@ -1128,13 +1246,21 @@
       this.isNaturalColor = Math.max(0.0, 1.0 - dist * 5.0);
     }
 
-    setIntensity(value01) {
-      this.intensity = Math.max(0.05, Math.min(1.0, value01));
+    setIntensity(value) {
+      this.intensity = Math.max(0.01, Math.min(1.5, value));
     }
 
-    setBrightnessRange(min01, max01) {
-      this.minBrightness = Math.max(0.0, Math.min(1.0, min01));
-      this.maxBrightness = Math.max(this.minBrightness, Math.min(1.0, max01));
+    setTimeScale(scale) {
+      this.timeScale = Math.max(0.05, Math.min(8.0, scale));
+    }
+
+    setCameraDistance(dist) {
+      this.targetCameraDist = Math.max(0.25, Math.min(4.0, dist));
+    }
+
+    setBrightnessRange(minVal, maxVal) {
+      this.minBrightness = Math.max(0.0, Math.min(1.5, minVal));
+      this.maxBrightness = Math.max(this.minBrightness, Math.min(1.5, maxVal));
     }
 
     setFadeProgress(progress01) {
@@ -1145,13 +1271,22 @@
       this.fadeBrightnessMul = remain <= 0.0001 ? 0.0 : Math.pow(remain, 1.15);
     }
 
-    setTouch(active, normX, normY, velX, velY) {
+    // Convert viewport normalized coords (0..1, bottom-up) into campfire simulation coords
+    screenToSimUv(screenX, screenY) {
+      return [
+        (screenX - 0.5) * this.cameraDist + 0.5,
+        (screenY - this.anchorY) * this.cameraDist + this.baseY,
+      ];
+    }
+
+    setTouch(active, screenX, screenY, velScreenX, velScreenY) {
       this.touchActive = active;
       if (active) {
-        this.touchPos[0] = normX;
-        this.touchPos[1] = normY;
-        this.touchVel[0] = velX;
-        this.touchVel[1] = velY;
+        const [sx, sy] = this.screenToSimUv(screenX, screenY);
+        this.touchPos[0] = sx;
+        this.touchPos[1] = sy;
+        this.touchVel[0] = velScreenX * this.cameraDist;
+        this.touchVel[1] = velScreenY * this.cameraDist;
       } else {
         this.touchVel[0] *= 0.5;
         this.touchVel[1] *= 0.5;
@@ -1164,46 +1299,46 @@
       this.sparks = [];
       for (let i = 0; i < this.sparkCount; i++) {
         const s = this._spawnSpark(true);
-        // Scatter initial rising sparks smoothly up the plume
-        s.y += s.life * 0.52;
+        s.y += s.life * 0.45;
         this.sparks.push(s);
       }
     }
 
     _spawnSpark(randomLife) {
       const spread = (Math.random() - 0.5) * 1.45 * this.fireHalfW;
-      const effInt = this.intensity * this.fadeIntensityMul;
+      const effInt = Math.min(1.5, this.intensity * this.fadeIntensityMul);
       return {
-        x: 0.5 + spread * (0.35 + 0.65 * Math.random()),
-        y: this.baseY + Math.random() * 0.08,
-        vx: (Math.random() - 0.5) * 0.08,
-        vy: (0.18 + Math.random() * 0.28) * (0.45 + 0.85 * effInt),
+        x: 0.5 + spread * (0.30 + 0.70 * Math.random()),
+        y: this.baseY + Math.random() * 0.06,
+        vx: (Math.random() - 0.5) * 0.10,
+        vy: (0.20 + Math.random() * 0.30) * (0.42 + 0.75 * effInt),
         life: randomLife ? Math.random() : 0.0,
-        maxLife: 1.5 + Math.random() * 2.6,
-        size: 1.8 + Math.random() * 3.1,
+        maxLife: 1.0 + Math.random() * 2.0,
+        size: 1.8 + Math.random() * 2.9,
         phase: Math.random() * Math.PI * 2,
-        wobble: 1.8 + Math.random() * 3.8,
+        wobble: 2.4 + Math.random() * 4.6,
       };
     }
 
-    _updateSparks(dt, effInt) {
-      const activeTarget = Math.floor(this.sparkCount * (0.20 + 0.80 * effInt));
-      const breeze = Math.sin(this.time * 0.62) * 0.048 + Math.sin(this.time * 1.53 + 1.1) * 0.022;
+    _updateSparks(simDt, effInt) {
+      const normInt = Math.min(1.0, effInt / 1.1);
+      const activeTarget = Math.floor(this.sparkCount * (0.14 + 0.86 * normInt));
+      const breeze = this.breezeVal * 0.11;
 
       for (let i = 0; i < this.sparkCount; i++) {
         const s = this.sparks[i];
-        s.life += dt / s.maxLife;
+        s.life += simDt / s.maxLife;
 
-        if (s.life >= 1.0 || s.y > 1.05 || s.x < -0.05 || s.x > 1.05) {
-          if (i < activeTarget && effInt > 0.04 && Math.random() < 0.35 + 0.65 * effInt) {
+        if (s.life >= 1.0 || s.y > 1.8 || s.x < -0.6 || s.x > 1.6) {
+          if (i < activeTarget && effInt > 0.02 && Math.random() < 0.32 + 0.68 * normInt) {
             this.sparks[i] = this._spawnSpark(false);
           } else {
             s.life = 1.0;
           }
         } else {
-          const turbX = Math.sin(this.time * s.wobble + s.phase + s.y * 12.0) * 0.095;
-          s.vx += (breeze + turbX - s.vx * 1.5) * dt;
-          s.vy += ((0.18 + 0.24 * effInt) - s.vy * 0.82) * dt;
+          const turbX = Math.sin(this.time * s.wobble + s.phase + s.y * 14.0) * 0.12;
+          s.vx += (breeze + turbX - s.vx * 1.7) * simDt;
+          s.vy += ((0.20 + 0.24 * Math.min(effInt, 1.3)) - s.vy * 0.9) * simDt;
 
           if (this.touchActive) {
             const dx = (s.x - this.touchPos[0]) * this.aspect;
@@ -1213,16 +1348,16 @@
             s.vy += this.touchVel[1] * 0.0007 * w;
           }
 
-          s.x += s.vx * dt;
-          s.y += s.vy * dt;
+          s.x += s.vx * simDt;
+          s.y += s.vy * simDt;
         }
 
         const alive = s.life < 1.0 && i < activeTarget;
-        const fadeIn = Math.min(1.0, s.life * 6.0);
+        const fadeIn = Math.min(1.0, s.life * 7.0);
         const fadeOut = Math.max(0.0, 1.0 - s.life);
-        const flicker = 0.65 + 0.35 * Math.sin(this.time * 18.0 + s.phase * 5.0);
-        const alpha = alive ? fadeIn * Math.pow(fadeOut, 1.2) * flicker * (0.50 + 0.50 * effInt) : 0.0;
-        const heat = Math.max(0.0, 1.0 - s.life * 1.1);
+        const flicker = 0.62 + 0.38 * Math.sin(this.time * 22.0 + s.phase * 5.0);
+        const alpha = alive ? fadeIn * Math.pow(fadeOut, 1.2) * flicker * (0.45 + 0.55 * normInt) : 0.0;
+        const heat = Math.max(0.0, 1.0 - s.life * 1.15);
 
         const off = i * 5;
         this.sparkData[off] = s.x;
@@ -1233,16 +1368,14 @@
       }
     }
 
-    // --- Organic Flicker / Breathing Envelope bounded by [minBrightness, maxBrightness] ---
+    // --- 1/f Pink-Noise Brightness Envelope bounded by [minBrightness, maxBrightness] ---
 
-    _computeBrightnessEnvelope(t, effInt) {
-      const w1 = Math.sin(t * 0.63) * 0.34;
-      const w2 = Math.sin(t * 1.47 + 1.1) * 0.25;
-      const w3 = Math.sin(t * 2.91 + 2.7) * 0.19;
-      const w4 = Math.sin(t * 5.23 + 0.4) * 0.13;
-      const w5 = Math.sin(t * 8.17 + 3.9) * 0.09;
-      const raw = 0.5 + 0.5 * (w1 + w2 + w3 + w4 + w5);
-      const organic = Math.max(0.0, Math.min(1.0, raw * 0.90 + 0.10 * effInt));
+    _computeBrightnessEnvelope(effInt) {
+      // Stretch 1/f pink noise smoothly across [0, 1] so natural campfire breathing uses the full range
+      const p = this.brightnessPink.value;
+      const expanded = Math.max(0.0, Math.min(1.0, (p - 0.24) / 0.52));
+      const smooth = expanded * expanded * (3.0 - 2.0 * expanded);
+      const organic = Math.max(0.0, Math.min(1.0, smooth * 0.92 + 0.08 * Math.min(effInt, 1.0)));
       const ranged = this.minBrightness + (this.maxBrightness - this.minBrightness) * organic;
       return ranged * this.fadeBrightnessMul;
     }
@@ -1283,13 +1416,23 @@
       const gl = this.gl;
       if (!gl || this.contextLost) return;
 
-      const dt = Math.min(Math.max(rawDt, 0.001), 0.033);
-      this.time += dt;
+      const realDt = Math.min(Math.max(rawDt, 0.001), 0.033);
+
+      // Smooth cinematic camera dolly interpolation
+      this.cameraDist += (this.targetCameraDist - this.cameraDist) * Math.min(1.0, realDt * 12.0);
+      this.anchorY = this._computeAnchorY(this.cameraDist);
+
+      // Base physical clock tuned 1.65x brisker for human-scale campfire dynamics, scaled by user timeScale
+      const totalSimDt = realDt * 1.65 * this.timeScale;
 
       const effInt = this.intensity * this.fadeIntensityMul;
-      const emberHeat = (0.35 + 0.65 * this.intensity) * this.fadeEmberMul;
-      const targetBright = this._computeBrightnessEnvelope(this.time, effInt);
-      this.currentBrightness += (targetBright - this.currentBrightness) * Math.min(1.0, dt * 14.0);
+      const emberHeat = (0.30 + 0.70 * Math.min(this.intensity, 1.25)) * this.fadeEmberMul;
+
+      // Advance 1/f pink noise & compute brightness
+      this._stepPinkNoises(totalSimDt);
+      const targetBright = this._computeBrightnessEnvelope(effInt);
+      const brightLerp = Math.min(1.0, realDt * (10.0 + 12.0 * Math.min(this.timeScale, 3.0)));
+      this.currentBrightness += (targetBright - this.currentBrightness) * brightLerp;
 
       if (this.fadeBrightnessMul <= 0.0001 && this.currentBrightness < 0.001) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -1302,32 +1445,44 @@
       gl.disable(gl.BLEND);
 
       if (this.useFluidSim && this.fbos) {
-        this._stepFluid(dt, effInt);
+        // Adaptive substepping keeps PDE solver rock-solid from 0.05x slow-mo up to 8.0x speed!
+        const maxSubDt = 0.028;
+        const substeps = Math.min(6, Math.max(1, Math.ceil(totalSimDt / maxSubDt)));
+        const subDt = Math.min(maxSubDt, totalSimDt / substeps);
+        const jacobiIters = substeps >= 4 ? 8 : (substeps >= 2 ? 11 : 14);
+
+        for (let s = 0; s < substeps; s++) {
+          this.time += subDt;
+          if (s > 0) this._stepPinkNoises(subDt);
+          this._stepFluid(subDt, effInt, jacobiIters);
+        }
         this._renderFluidDisplay(effInt, emberHeat);
       } else {
+        this.time += totalSimDt;
         this._renderFallback(effInt, emberHeat);
       }
 
-      this._updateSparks(dt, effInt);
+      this._updateSparks(totalSimDt, effInt);
       this._renderSparks();
 
       this.touchVel[0] *= 0.82;
       this.touchVel[1] *= 0.82;
     }
 
-    _stepFluid(dt, effInt) {
+    _stepFluid(dt, effInt, jacobiIters) {
       const gl = this.gl;
       const p = this.programs;
       const f = this.fbos;
       const tx = 1.0 / this.simW;
       const ty = 1.0 / this.simH;
 
-      // Balanced convective lift + rich vorticity confinement for broad, multi-tongued campfire flames
-      const buoyancy = this.simH * (0.52 + 0.62 * effInt);
-      const curlStrength = 20.0 + 22.0 * effInt;
-      const cooling = 1.65 - 0.62 * effInt;
+      const clampedInt = Math.min(effInt, 1.5);
+      // Human-scale campfire balance: brisk lift, agile small eddies, crisp cooling
+      const buoyancy = this.simH * (0.48 + 0.56 * clampedInt);
+      const curlStrength = 22.0 + 24.0 * Math.min(clampedInt, 1.3);
+      const cooling = Math.max(0.72, 2.18 - 0.86 * clampedInt);
 
-      // 1. Emit fuel & heat into state
+      // 1. Emit fuel & heat into state (modulated by 5 live 1/f pink-noise streams!)
       this._bindQuad(p.emitState);
       this._bindTex(0, f.state.read.tex, p.emitState.uniforms.uState);
       gl.uniform1f(p.emitState.uniforms.uTime, this.time);
@@ -1335,6 +1490,14 @@
       gl.uniform1f(p.emitState.uniforms.uIntensity, effInt);
       gl.uniform1f(p.emitState.uniforms.uFireHalfW, this.fireHalfW);
       gl.uniform1f(p.emitState.uniforms.uBaseY, this.baseY);
+      gl.uniform4f(
+        p.emitState.uniforms.uJetNoise,
+        this.jetVals[0],
+        this.jetVals[1],
+        this.jetVals[3],
+        this.jetVals[4]
+      );
+      gl.uniform1f(p.emitState.uniforms.uJetCenter, this.jetVals[2]);
       gl.uniform2f(p.emitState.uniforms.uTouchPos, this.touchPos[0], this.touchPos[1]);
       gl.uniform2f(p.emitState.uniforms.uTouchVel, this.touchVel[0], this.touchVel[1]);
       gl.uniform1f(p.emitState.uniforms.uTouchActive, this.touchActive ? 1.0 : 0.0);
@@ -1342,7 +1505,7 @@
       this._blit(f.state.write);
       f.state.swap();
 
-      // 2. Buoyancy, entrainment, breeze & touch momentum
+      // 2. Buoyancy, entrainment, 1/f breeze & touch momentum
       this._bindQuad(p.buoyancy);
       this._bindTex(0, f.velocity.read.tex, p.buoyancy.uniforms.uVelocity);
       this._bindTex(1, f.state.read.tex, p.buoyancy.uniforms.uState);
@@ -1352,6 +1515,7 @@
       gl.uniform1f(p.buoyancy.uniforms.uIntensity, effInt);
       gl.uniform1f(p.buoyancy.uniforms.uFireHalfW, this.fireHalfW);
       gl.uniform1f(p.buoyancy.uniforms.uBaseY, this.baseY);
+      gl.uniform1f(p.buoyancy.uniforms.uBreeze, this.breezeVal);
       gl.uniform2f(p.buoyancy.uniforms.uTouchPos, this.touchPos[0], this.touchPos[1]);
       gl.uniform2f(p.buoyancy.uniforms.uTouchVel, this.touchVel[0], this.touchVel[1]);
       gl.uniform1f(p.buoyancy.uniforms.uTouchActive, this.touchActive ? 1.0 : 0.0);
@@ -1385,15 +1549,15 @@
       // 6. Warm-start pressure
       this._bindQuad(p.clearScale);
       this._bindTex(0, f.pressure.read.tex, p.clearScale.uniforms.uTex);
-      gl.uniform1f(p.clearScale.uniforms.uScale, 0.82);
+      gl.uniform1f(p.clearScale.uniforms.uScale, 0.80);
       this._blit(f.pressure.write);
       f.pressure.swap();
 
-      // 7. Jacobi pressure solver (16 iterations)
+      // 7. Jacobi pressure solver
       this._bindQuad(p.pressure);
       this._bindTex(1, f.divergence.tex, p.pressure.uniforms.uDivergence);
       gl.uniform2f(p.pressure.uniforms.uTexel, tx, ty);
-      for (let i = 0; i < 16; i++) {
+      for (let i = 0; i < jacobiIters; i++) {
         this._bindTex(0, f.pressure.read.tex, p.pressure.uniforms.uPressure);
         this._blit(f.pressure.write);
         f.pressure.swap();
@@ -1413,7 +1577,7 @@
       this._bindTex(1, f.velocity.read.tex, p.advect.uniforms.uSource);
       gl.uniform2f(p.advect.uniforms.uTexel, tx, ty);
       gl.uniform1f(p.advect.uniforms.uDt, dt);
-      gl.uniform1f(p.advect.uniforms.uDissipation, 0.992);
+      gl.uniform1f(p.advect.uniforms.uDissipation, 0.990);
       this._blit(f.velocity.write);
       f.velocity.swap();
 
@@ -1435,7 +1599,7 @@
       this._blit(f.state.write);
       f.state.swap();
 
-      // 10. Combustion & Radiative Cooling
+      // 10. Combustion & Short-Timescale Radiative Cooling
       this._bindQuad(p.combustion);
       this._bindTex(0, f.state.read.tex, p.combustion.uniforms.uState);
       gl.uniform1f(p.combustion.uniforms.uDt, dt);
@@ -1457,6 +1621,8 @@
       gl.uniform1f(p.uniforms.uAspect, this.aspect);
       gl.uniform1f(p.uniforms.uFireHalfW, this.fireHalfW);
       gl.uniform1f(p.uniforms.uBaseY, this.baseY);
+      gl.uniform1f(p.uniforms.uCameraDist, this.cameraDist);
+      gl.uniform1f(p.uniforms.uAnchorY, this.anchorY);
       gl.uniform3f(p.uniforms.uBaseColor, this.baseColor[0], this.baseColor[1], this.baseColor[2]);
       gl.uniform1f(p.uniforms.uIsNatural, this.isNaturalColor);
       gl.uniform1f(p.uniforms.uBrightness, this.currentBrightness);
@@ -1474,11 +1640,14 @@
       gl.uniform1f(p.uniforms.uAspect, this.aspect);
       gl.uniform1f(p.uniforms.uFireHalfW, this.fireHalfW);
       gl.uniform1f(p.uniforms.uBaseY, this.baseY);
+      gl.uniform1f(p.uniforms.uCameraDist, this.cameraDist);
+      gl.uniform1f(p.uniforms.uAnchorY, this.anchorY);
       gl.uniform3f(p.uniforms.uBaseColor, this.baseColor[0], this.baseColor[1], this.baseColor[2]);
       gl.uniform1f(p.uniforms.uIsNatural, this.isNaturalColor);
       gl.uniform1f(p.uniforms.uBrightness, this.currentBrightness);
       gl.uniform1f(p.uniforms.uEmberHeat, emberHeat);
       gl.uniform1f(p.uniforms.uIntensity, effInt);
+      gl.uniform1f(p.uniforms.uBreeze, this.breezeVal);
       gl.uniform2f(p.uniforms.uTouchPos, this.touchPos[0], this.touchPos[1]);
       gl.uniform2f(p.uniforms.uTouchVel, this.touchVel[0], this.touchVel[1]);
       gl.uniform1f(p.uniforms.uTouchActive, this.touchActive ? 1.0 : 0.0);
@@ -1510,6 +1679,9 @@
       gl.vertexAttribPointer(p.attribs.aAlpha, 1, gl.FLOAT, false, stride, 16);
 
       gl.uniform1f(p.uniforms.uDpr, this.dpr);
+      gl.uniform1f(p.uniforms.uCameraDist, this.cameraDist);
+      gl.uniform1f(p.uniforms.uAnchorY, this.anchorY);
+      gl.uniform1f(p.uniforms.uBaseY, this.baseY);
       gl.uniform3f(p.uniforms.uBaseColor, this.baseColor[0], this.baseColor[1], this.baseColor[2]);
       gl.uniform1f(p.uniforms.uIsNatural, this.isNaturalColor);
       gl.uniform1f(p.uniforms.uBrightness, this.currentBrightness);

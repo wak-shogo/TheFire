@@ -1,12 +1,19 @@
 (function () {
   'use strict';
 
-  const STORAGE_KEY = 'thefire.settings.v1';
+  const STORAGE_KEY = 'thefire.settings.v2';
+
+  const TIME_SCALE_MIN = 0.05;
+  const TIME_SCALE_MAX = 8.0;
+  const DIST_MIN = 0.25;
+  const DIST_MAX = 4.0;
 
   const DEFAULTS = {
     color: '#ff6a14',
     colorName: '焚き火',
-    intensity: 68,
+    intensity: 55,
+    timeScale: 1.0,
+    cameraDistance: 1.25,
     maxBrightness: 95,
     minBrightness: 35,
     fadeoutMinutes: 0,
@@ -26,6 +33,10 @@
 
   const intensityRange = document.getElementById('intensityRange');
   const intensityValue = document.getElementById('intensityValue');
+  const timeScaleRange = document.getElementById('timeScaleRange');
+  const timeScaleValue = document.getElementById('timeScaleValue');
+  const distanceRange = document.getElementById('distanceRange');
+  const distanceValue = document.getElementById('distanceValue');
   const maxBrightnessRange = document.getElementById('maxBrightnessRange');
   const maxBrightnessValue = document.getElementById('maxBrightnessValue');
   const minBrightnessRange = document.getElementById('minBrightnessRange');
@@ -38,6 +49,40 @@
   const fadeRemaining = document.getElementById('fadeRemaining');
   const relightBtn = document.getElementById('relightBtn');
   const resetBtn = document.getElementById('resetBtn');
+
+  // Logarithmic slider mapping helpers (0..1000 <-> [min..max])
+  function logSliderToValue(pos, min, max) {
+    const t = Math.max(0, Math.min(1, pos / 1000));
+    return min * Math.pow(max / min, t);
+  }
+
+  function valueToLogSlider(val, min, max) {
+    const clamped = Math.max(min, Math.min(max, val));
+    const t = Math.log(clamped / min) / Math.log(max / min);
+    return Math.round(t * 1000);
+  }
+
+  function clampInt(v, min, max, fallback) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, Math.round(n)));
+  }
+
+  function clampFloat(v, min, max, fallback) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+  }
+
+  function formatTimeScale(v) {
+    if (v < 1) return `${v.toFixed(2)}×`;
+    if (v < 4) return `${v.toFixed(2)}×`;
+    return `${v.toFixed(1)}×`;
+  }
+
+  function formatDistance(v) {
+    return `${v.toFixed(2)}m`;
+  }
 
   // State
   let settings = loadSettings();
@@ -62,10 +107,12 @@
       return {
         color: typeof parsed.color === 'string' ? parsed.color : DEFAULTS.color,
         colorName: typeof parsed.colorName === 'string' ? parsed.colorName : DEFAULTS.colorName,
-        intensity: clampNum(parsed.intensity, 10, 100, DEFAULTS.intensity),
-        maxBrightness: clampNum(parsed.maxBrightness, 5, 100, DEFAULTS.maxBrightness),
-        minBrightness: clampNum(parsed.minBrightness, 0, 100, DEFAULTS.minBrightness),
-        fadeoutMinutes: clampNum(parsed.fadeoutMinutes, 0, 60, DEFAULTS.fadeoutMinutes),
+        intensity: clampInt(parsed.intensity, 1, 150, DEFAULTS.intensity),
+        timeScale: clampFloat(parsed.timeScale, TIME_SCALE_MIN, TIME_SCALE_MAX, DEFAULTS.timeScale),
+        cameraDistance: clampFloat(parsed.cameraDistance, DIST_MIN, DIST_MAX, DEFAULTS.cameraDistance),
+        maxBrightness: clampInt(parsed.maxBrightness, 1, 150, DEFAULTS.maxBrightness),
+        minBrightness: clampInt(parsed.minBrightness, 0, 150, DEFAULTS.minBrightness),
+        fadeoutMinutes: clampInt(parsed.fadeoutMinutes, 0, 180, DEFAULTS.fadeoutMinutes),
       };
     } catch {
       return { ...DEFAULTS };
@@ -76,14 +123,8 @@
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
     } catch {
-      // Ignore storage errors (private browsing, etc.)
+      // Ignore storage errors
     }
-  }
-
-  function clampNum(v, min, max, fallback) {
-    const n = Number(v);
-    if (!Number.isFinite(n)) return fallback;
-    return Math.min(max, Math.max(min, Math.round(n)));
   }
 
   function hexToRgba(hex, alpha) {
@@ -107,8 +148,12 @@
 
   function formatRemaining(ms) {
     const totalSec = Math.max(0, Math.ceil(ms / 1000));
-    const min = Math.floor(totalSec / 60);
+    const hrs = Math.floor(totalSec / 3600);
+    const min = Math.floor((totalSec % 3600) / 60);
     const sec = totalSec % 60;
+    if (hrs > 0) {
+      return `残り ${hrs}:${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    }
     return `残り ${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
   }
 
@@ -120,7 +165,6 @@
       settings.minBrightness = settings.maxBrightness;
     }
 
-    // Accent theme follows chosen flame color
     document.documentElement.style.setProperty('--accent', settings.color);
     document.documentElement.style.setProperty('--accent-soft', hexToRgba(settings.color, 0.28));
 
@@ -144,6 +188,14 @@
     intensityValue.textContent = `${settings.intensity}%`;
     updateSliderFill(intensityRange);
 
+    timeScaleRange.value = String(valueToLogSlider(settings.timeScale, TIME_SCALE_MIN, TIME_SCALE_MAX));
+    timeScaleValue.textContent = formatTimeScale(settings.timeScale);
+    updateSliderFill(timeScaleRange);
+
+    distanceRange.value = String(valueToLogSlider(settings.cameraDistance, DIST_MIN, DIST_MAX));
+    distanceValue.textContent = formatDistance(settings.cameraDistance);
+    updateSliderFill(distanceRange);
+
     maxBrightnessRange.value = String(settings.maxBrightness);
     maxBrightnessValue.textContent = `${settings.maxBrightness}%`;
     updateSliderFill(maxBrightnessRange);
@@ -163,6 +215,8 @@
     // Update simulation parameters
     sim.setColor(settings.color);
     sim.setIntensity(settings.intensity / 100);
+    sim.setTimeScale(settings.timeScale);
+    sim.setCameraDistance(settings.cameraDistance);
     sim.setBrightnessRange(settings.minBrightness / 100, settings.maxBrightness / 100);
 
     // Fade-out timer management
@@ -245,7 +299,7 @@
     }, 3500);
   }
 
-  // --- Screen Wake Lock (keeps phone screen awake while enjoying the fire) ---
+  // --- Screen Wake Lock ---
 
   async function requestWakeLock() {
     if (!('wakeLock' in navigator) || document.visibilityState !== 'visible' || isExtinguished) {
@@ -258,7 +312,7 @@
         wakeLock = null;
       });
     } catch {
-      // Ignore if battery saver or browser policy blocks wake lock
+      // Ignore
     }
   }
 
@@ -292,7 +346,7 @@
     }
   });
 
-  // Swipe right on drawer to close smoothly on mobile
+  // Swipe right on drawer to dismiss
   let drawerTouchStartX = null;
   let drawerTouchStartY = null;
   drawer.addEventListener('touchstart', (e) => {
@@ -335,7 +389,19 @@
     applySettings();
   });
 
-  // Max & Min Brightness (smoothly coupled so min <= max always holds)
+  // Time Scale (logarithmic)
+  timeScaleRange.addEventListener('input', (e) => {
+    settings.timeScale = logSliderToValue(Number(e.target.value), TIME_SCALE_MIN, TIME_SCALE_MAX);
+    applySettings();
+  });
+
+  // Camera Distance (logarithmic)
+  distanceRange.addEventListener('input', (e) => {
+    settings.cameraDistance = logSliderToValue(Number(e.target.value), DIST_MIN, DIST_MAX);
+    applySettings();
+  });
+
+  // Max & Min Brightness (coupled so min <= max)
   maxBrightnessRange.addEventListener('input', (e) => {
     settings.maxBrightness = Number(e.target.value);
     if (settings.minBrightness > settings.maxBrightness) {
@@ -347,7 +413,7 @@
   minBrightnessRange.addEventListener('input', (e) => {
     settings.minBrightness = Number(e.target.value);
     if (settings.maxBrightness < settings.minBrightness) {
-      settings.maxBrightness = Math.max(5, settings.minBrightness);
+      settings.maxBrightness = Math.max(1, settings.minBrightness);
     }
     applySettings();
   });
@@ -376,65 +442,108 @@
     applySettings({ restartFade: true });
   });
 
-  // --- Interactive Touch / Mouse Stirring on the Bonfire Canvas ---
+  // --- Interactive Touch Stirring + Two-Finger Pinch Zoom (Camera Distance) + Wheel Zoom ---
 
-  let activePointerId = null;
-  let lastPtrX = 0;
-  let lastPtrY = 0;
-  let lastPtrTime = 0;
+  const activePointers = new Map();
+  let lastSingleX = 0;
+  let lastSingleY = 0;
+  let lastSingleTime = 0;
+  let pinchStartSpan = null;
+  let pinchStartDist = null;
 
-  function toSimUv(clientX, clientY) {
+  function toScreenUv(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
     const x = (clientX - rect.left) / Math.max(1, rect.width);
     const y = 1.0 - (clientY - rect.top) / Math.max(1, rect.height);
     return [x, y];
   }
 
+  function getPinchSpan() {
+    const pts = Array.from(activePointers.values());
+    if (pts.length < 2) return 0;
+    return Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+  }
+
   canvas.addEventListener('pointerdown', (e) => {
     wakeMenuButton();
 
-    // If extinguished after fade-out, tapping the dark screen gently rekindles the fire
     if (isExtinguished) {
       startFadeTimer();
       return;
     }
 
-    activePointerId = e.pointerId;
     canvas.setPointerCapture(e.pointerId);
-    const [u, v] = toSimUv(e.clientX, e.clientY);
-    lastPtrX = u;
-    lastPtrY = v;
-    lastPtrTime = performance.now();
-    sim.setTouch(true, u, v, 0, 12);
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (activePointers.size === 1) {
+      const [u, v] = toScreenUv(e.clientX, e.clientY);
+      lastSingleX = u;
+      lastSingleY = v;
+      lastSingleTime = performance.now();
+      sim.setTouch(true, u, v, 0, 12);
+    } else if (activePointers.size === 2) {
+      // Transition cleanly into two-finger pinch camera dolly
+      sim.setTouch(false, 0, 0, 0, 0);
+      pinchStartSpan = getPinchSpan();
+      pinchStartDist = settings.cameraDistance;
+    }
   });
 
   canvas.addEventListener('pointermove', (e) => {
-    if (e.pointerType === 'mouse' && activePointerId === null) {
+    if (e.pointerType === 'mouse' && activePointers.size === 0) {
       wakeMenuButton();
       return;
     }
-    if (e.pointerId !== activePointerId) return;
+    if (!activePointers.has(e.pointerId)) return;
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-    const now = performance.now();
-    const dt = Math.max(0.008, (now - lastPtrTime) / 1000);
-    const [u, v] = toSimUv(e.clientX, e.clientY);
-    const vx = ((u - lastPtrX) / dt) * sim.simW * 0.42;
-    const vy = ((v - lastPtrY) / dt) * sim.simH * 0.42;
+    if (activePointers.size === 2 && pinchStartSpan > 8) {
+      const span = getPinchSpan();
+      if (span > 8) {
+        // Spreading fingers zooms in (smaller camera distance); pinching out zooms out
+        const ratio = pinchStartSpan / span;
+        settings.cameraDistance = clampFloat(pinchStartDist * ratio, DIST_MIN, DIST_MAX, settings.cameraDistance);
+        applySettings();
+      }
+      return;
+    }
 
-    sim.setTouch(true, u, v, vx, vy);
-    lastPtrX = u;
-    lastPtrY = v;
-    lastPtrTime = now;
+    if (activePointers.size === 1) {
+      const now = performance.now();
+      const dt = Math.max(0.008, (now - lastSingleTime) / 1000);
+      const [u, v] = toScreenUv(e.clientX, e.clientY);
+      const vx = ((u - lastSingleX) / dt) * sim.simW * 0.42;
+      const vy = ((v - lastSingleY) / dt) * sim.simH * 0.42;
+
+      sim.setTouch(true, u, v, vx, vy);
+      lastSingleX = u;
+      lastSingleY = v;
+      lastSingleTime = now;
+    }
   });
 
   function endPointer(e) {
-    if (e.pointerId !== activePointerId) return;
-    activePointerId = null;
-    sim.setTouch(false, 0, 0, 0, 0);
+    activePointers.delete(e.pointerId);
+    if (activePointers.size < 2) {
+      pinchStartSpan = null;
+      pinchStartDist = null;
+    }
+    if (activePointers.size === 0) {
+      sim.setTouch(false, 0, 0, 0, 0);
+    }
   }
 
   canvas.addEventListener('pointerup', endPointer);
   canvas.addEventListener('pointercancel', endPointer);
+
+  // Mouse wheel subtly adjusts camera distance on desktop
+  canvas.addEventListener('wheel', (e) => {
+    if (menuOpen) return;
+    e.preventDefault();
+    const factor = Math.exp(e.deltaY * 0.0012);
+    settings.cameraDistance = clampFloat(settings.cameraDistance * factor, DIST_MIN, DIST_MAX, settings.cameraDistance);
+    applySettings();
+  }, { passive: false });
 
   // Resize & Orientation Change
   let resizeRaf = 0;
